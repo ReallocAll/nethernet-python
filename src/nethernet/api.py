@@ -45,6 +45,7 @@ from nethernet.limits import ConnectionLimits
 from nethernet.network_id import NetworkID, new_connection_id
 from nethernet.session import Session, SessionState
 from nethernet.signaling.http import HttpSignalingServer, _check_sdp_size, request_answer
+from nethernet.transport.peer_connection import DtlsByteCounts
 from nethernet.transport_api import Transport
 
 # Cap on packets buffered for an incoming connection before its Connection object exists (an app
@@ -106,6 +107,16 @@ class Connection:
     @property
     def state(self) -> SessionState:
         return self._session.state
+
+    def get_dtls_byte_counts(self) -> DtlsByteCounts:
+        """Return an immutable DTLS byte snapshot on this connection's event loop.
+
+        Counts include handshakes, SCTP and retransmissions, and remain available after
+        ``await close()``. They exclude ICE overhead and UDP/IP headers.
+        """
+        if asyncio.get_running_loop() is not self._connected.get_loop():
+            raise RuntimeError("DTLS byte counts must be read on the connection's event loop")
+        return self._session._pc.get_dtls_byte_counts()
 
     # -- message I/O (SPEC.md s6.2-s6.3) -----------------------------------------------
 

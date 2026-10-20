@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from aiortc import (
     RTCConfiguration,
@@ -32,6 +33,7 @@ from aiortc import (
     RTCSessionDescription,
 )
 from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
+from aiortc.stats import RTCTransportStats
 
 from nethernet.errors import SendType
 from nethernet.limits import ConnectionLimits
@@ -40,6 +42,14 @@ from nethernet.transport.framing import FRAGMENT_SIZE, MAX_PACKET_SIZE, PacketQu
 RELIABLE_LABEL = "ReliableDataChannel"  # SPEC.md s6.2
 UNRELIABLE_LABEL = "UnreliableDataChannel"  # SPEC.md s6.2
 MAX_MESSAGE_SIZE = 262144  # SPEC.md s6.1
+
+
+@dataclass(frozen=True, slots=True)
+class DtlsByteCounts:
+    """Cumulative bytes at the DTLS transport's ICE-facing boundary."""
+
+    bytes_sent: int
+    bytes_received: int
 
 
 class SendPermit:
@@ -196,6 +206,26 @@ class PeerConnection:
             @self._pc.on("datachannel")
             def _on_datachannel(channel: RTCDataChannel) -> None:
                 self._register_channel(channel)
+
+    def get_dtls_byte_counts(self) -> DtlsByteCounts:
+        """Snapshot the pinned aiortc DTLS counters, including after transport close."""
+        sctp = self._pc.sctp
+        if sctp is None:
+            return DtlsByteCounts(0, 0)
+        report = sctp.transport._get_stats()
+        if len(report) != 1:
+            raise RuntimeError("Expected one DTLS transport statistics entry")
+        stats = next(iter(report.values()))
+        if (
+            not isinstance(stats, RTCTransportStats)
+            or stats.type != "transport"
+            or type(stats.bytesSent) is not int
+            or type(stats.bytesReceived) is not int
+            or stats.bytesSent < 0
+            or stats.bytesReceived < 0
+        ):
+            raise RuntimeError("Unexpected DTLS transport statistics entry")
+        return DtlsByteCounts(stats.bytesSent, stats.bytesReceived)
 
     # -- SDP / negotiation -------------------------------------------------------------
 

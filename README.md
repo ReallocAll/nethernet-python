@@ -117,6 +117,20 @@ fragmented, so anything over 262143 bytes is dropped rather than sent.
 Carrying Bedrock itself is one packet batch per message: length-prefixed game packets, without
 the `0xFE` byte RakNet prefixes a batch with. A batch sent with that byte is silently ignored.
 
+## DTLS byte counts
+
+Call `conn.get_dtls_byte_counts()` synchronously on the connection's event loop to get a
+frozen, slotted `nethernet.DtlsByteCounts(bytes_sent, bytes_received)` snapshot. The cumulative
+counts cover bytes received from ICE by DTLS and bytes accepted by ICE from DTLS, including
+handshakes, SCTP and retransmissions. They measure neither application bytes nor queue occupancy,
+and exclude UDP/IP headers, HTTP signaling and ICE/STUN/TURN overhead. Sent bytes do not imply
+delivery or acknowledgement.
+
+Each snapshot is independent and remains unchanged. Counts start at zero for a new DTLS
+transport and remain readable and stable after `await conn.close()`. A connection without an
+SCTP transport reports zero; an unexpected statistics report from an existing transport raises
+`RuntimeError`.
+
 ## Identity assertions
 
 Both signaling directions can carry an `a=identity` assertion in the SDP: the client asserts an

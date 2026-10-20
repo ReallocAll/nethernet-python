@@ -44,6 +44,7 @@ from nethernet.limits import ConnectionLimits
 from nethernet.network_id import NetworkID, NetworkIDType, new_connection_id
 from nethernet.session import SessionState
 from nethernet.signaling.http import SignalingRejected
+from nethernet.transport.peer_connection import DtlsByteCounts
 
 __version__ = "0.0.2.dev0"
 
@@ -57,6 +58,7 @@ __all__ = [
     # connection objects
     "Connection",
     "ConnectionLimits",
+    "DtlsByteCounts",
     "Server",
     "HttpServer",
     "DiscoveredHost",
