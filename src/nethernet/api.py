@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -33,14 +34,17 @@ from nethernet.errors import (
 from nethernet.identity import (
     IdentityEnvelope,
     IdentitySigner,
+    InvalidIdentity,
     ServerIdentity,
     extract_identity,
+    insert_identity,
     strip_identity,
     verify_server_identity,
 )
+from nethernet.limits import ConnectionLimits
 from nethernet.network_id import NetworkID, new_connection_id
 from nethernet.session import Session, SessionState
-from nethernet.signaling.http import HttpSignalingServer, request_answer
+from nethernet.signaling.http import HttpSignalingServer, _check_sdp_size, request_answer
 from nethernet.transport_api import Transport
 
 # Cap on packets buffered for an incoming connection before its Connection object exists (an app
@@ -71,7 +75,8 @@ class Connection:
     """
 
     def __init__(
-        self, session: Session, endpoint: _Endpoint | None, *, owns_endpoint: bool = False
+        self, session: Session, endpoint: _Endpoint | None, *, owns_endpoint: bool = False,
+        limits: ConnectionLimits | None = None,
     ) -> None:
         self._session = session
         self._endpoint = endpoint
@@ -80,6 +85,9 @@ class Connection:
         self._connected: asyncio.Future[None] = asyncio.get_event_loop().create_future()
         self._closed = asyncio.Event()
         self._closed_error: SessionError | None = None
+        self._limits = limits
+        self._recv_bytes = 0
+        self._close_task: asyncio.Task | None = None
 
     # -- identity (SPEC.md s3, s9) -----------------------------------------------------
 
@@ -103,9 +111,28 @@ class Connection:
 
     async def send(self, data: bytes, reliability: SendType = SendType.RELIABLE) -> None:
         """Send an application packet; raises :class:`ConnectionClosed` if not connected."""
+        if not isinstance(data, bytes):
+            raise TypeError("NetherNet messages must be bytes")
+        if self._limits is not None:
+            if self._session.state is not SessionState.CONNECTED:
+                raise ConnectionClosed(self._closed_error or SessionError.NONE)
+            permit = self._session._pc.reserve_send_nowait(len(data), reliability)
+        else:
+            permit = await self.reserve_send(len(data), reliability)
+        try:
+            permit.send_nowait(data)
+        finally:
+            permit.release()
+
+    async def reserve_send(self, wire_bound: int, reliability: SendType = SendType.RELIABLE):
+        """Reserve capacity for a complete message before encoding its payload."""
         if self._session.state is not SessionState.CONNECTED:
             raise ConnectionClosed(self._closed_error or SessionError.NONE)
-        self._session.send(data, reliability)
+        permit = await self._session._pc.reserve_send(wire_bound, reliability)
+        if self._session.state is not SessionState.CONNECTED:
+            permit.release()
+            raise ConnectionClosed(self._closed_error or SessionError.NONE)
+        return permit
 
     async def recv(self) -> bytes:
         """Return the next complete application packet (SPEC.md s6.4 FIFO).
@@ -116,6 +143,7 @@ class Connection:
         if isinstance(item, _Closed):
             self._recv_queue.put_nowait(_CLOSED)  # sticky: subsequent recv() also raises
             raise ConnectionClosed(self._closed_error or SessionError.NONE)
+        self._recv_bytes -= len(item)
         return item
 
     def __aiter__(self) -> AsyncIterator[bytes]:
@@ -132,12 +160,38 @@ class Connection:
     # -- lifecycle (SPEC.md s9.5) ------------------------------------------------------
 
     async def close(self, error: SessionError = SessionError.NONE) -> None:
-        await self._session.aclose(error)
-        if self._owns_endpoint:
-            await self._endpoint.aclose()
+        await asyncio.shield(self._request_close(error))
+
+    def _request_close(self, error: SessionError = SessionError.NONE) -> asyncio.Task:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close(error))
+            self._close_task.add_done_callback(self._close_done)
+        return self._close_task
+
+    async def _close(self, error: SessionError) -> None:
+        try:
+            await self._session.aclose(error)
+        finally:
+            if self._owns_endpoint:
+                await self._endpoint.aclose()
+
+    @staticmethod
+    def _close_done(task: asyncio.Task) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def _join_failed_connect(self) -> None:
+        task = self._request_close(SessionError.GENERIC_FAILURE)
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                pass
+        task.result()
 
     async def wait_closed(self) -> SessionError:
         await self._closed.wait()
+        await asyncio.shield(self._request_close(self._closed_error or SessionError.NONE))
         return self._closed_error or SessionError.NONE
 
     async def __aenter__(self) -> Connection:
@@ -153,14 +207,26 @@ class Connection:
             self._connected.set_result(None)
 
     def _mark_closed(self, error: SessionError) -> None:
+        if self._closed_error is not None:
+            return
         self._closed_error = error
         if not self._connected.done():
             self._connected.set_exception(ConnectionFailed(error))
             self._connected.exception()  # mark retrieved; awaiting the future still raises
         self._recv_queue.put_nowait(_CLOSED)
         self._closed.set()
+        self._request_close(error)
 
     def _enqueue(self, data: bytes) -> None:
+        if self._closed_error is not None:
+            return
+        if self._limits is not None and (
+            self._recv_queue.qsize() >= self._limits.receive_messages
+            or self._recv_bytes + len(data) > self._limits.receive_bytes
+        ):
+            self._session.close(SessionError.GENERIC_FAILURE)
+            return
+        self._recv_bytes += len(data)
         self._recv_queue.put_nowait(data)
 
     async def _await_connected(self, timeout: float | None) -> None:
@@ -280,6 +346,7 @@ class Server:
         self._accept_task: asyncio.Task | None = None
         self._handler_tasks: set[asyncio.Task] = set()
         self._closed = asyncio.Event()
+        self._close_task: asyncio.Task | None = None
 
     async def start(self) -> Server:
         await self._endpoint.start()
@@ -307,14 +374,21 @@ class Server:
         await self._closed.wait()
 
     async def aclose(self) -> None:
-        if self._closed.is_set():
-            return
-        self._closed.set()
+        if self._close_task is None:
+            self._closed.set()
+            self._close_task = asyncio.create_task(self._close())
+            self._close_task.add_done_callback(Connection._close_done)
+        await asyncio.shield(self._close_task)
+
+    async def _close(self) -> None:
         if self._accept_task is not None:
             self._accept_task.cancel()
-        for task in list(self._handler_tasks):
+            await asyncio.gather(self._accept_task, return_exceptions=True)
+        tasks = list(self._handler_tasks)
+        for task in tasks:
             task.cancel()
         await self._endpoint.aclose()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     def set_advertisement(self, advertisement: bytes | None) -> None:
         self._endpoint.set_advertisement(advertisement)
@@ -486,6 +560,7 @@ def _make_http_session(
     ice_servers: list | None,
     relay_only: bool,
     negotiation_timeout: float,
+    limits: ConnectionLimits | None = None,
 ) -> Connection:
     """A Session/Connection pair with no LAN transport (full ICE: nothing to trickle)."""
     slot: list[Connection] = []
@@ -501,8 +576,9 @@ def _make_http_session(
         ice_servers=ice_servers,
         relay_only=relay_only,
         negotiation_timeout=negotiation_timeout,
+        limits=limits,
     )
-    conn = Connection(session, None)
+    conn = Connection(session, None, limits=limits)
     slot.append(conn)
     return conn
 
@@ -518,6 +594,8 @@ async def connect_http(
     on_server_identity: Callable[[ServerIdentity], Awaitable[None] | None] | None = None,
     identity_signer: IdentitySigner | None = None,
     timeout: float | None = None,
+    limits: ConnectionLimits | None = None,
+    sign_offer: Callable[[str], str] | None = None,
 ) -> Connection:
     """Dial a host through HTTP signaling (Onboarding Guide s4, s7).
 
@@ -529,7 +607,12 @@ async def connect_http(
     trust policy — TLS vs TOFU pinning of ``key_digest`` — is the caller's, and raising from
     the callback aborts the connection. Without it, any ``a=identity`` is stripped unverified.
     ``identity_signer`` signs the offer; BDS rejects an offer without ``a=identity``.
+    ``identity_signer`` and ``sign_offer`` are mutually exclusive.
     """
+    if identity_signer is not None and sign_offer is not None:
+        raise ValueError("identity_signer and sign_offer are mutually exclusive")
+    if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+        raise ValueError("Connection timeout must be positive and finite")
     local = local_id or NetworkID.p2p(new_connection_id())
     conn = _make_http_session(
         local_id=local,
@@ -540,31 +623,70 @@ async def connect_http(
         ice_servers=ice_servers,
         relay_only=relay_only,
         negotiation_timeout=negotiation_timeout,
+        limits=limits,
     )
     session = conn._session
     try:
-        offer_sdp = await session.offer()
-        if identity_signer is not None:
-            offer_sdp = identity_signer.sign(offer_sdp)
-        answer_sdp = await request_answer(
-            server_url,
-            str(local),
-            offer_sdp,
-            capability_check=capability_check,
-            timeout=negotiation_timeout,
+        deadline = timeout if timeout is not None else (
+            negotiation_timeout if limits is not None else None
         )
-        if on_server_identity is not None:
-            answer_sdp, server_identity = verify_server_identity(answer_sdp)
-            result = on_server_identity(server_identity)
-            if inspect.isawaitable(result):
-                await result
-        else:
-            answer_sdp = strip_identity(answer_sdp)
-        await session.accept_answer(answer_sdp)
-        await conn._await_connected(timeout)
+        async with asyncio.timeout(deadline):
+            offer_sdp = await session.offer()
+            if identity_signer is not None or sign_offer is not None:
+                if any(line.strip().startswith("a=identity:") for line in offer_sdp.splitlines()):
+                    raise InvalidIdentity("Offer already contains an identity assertion")
+                if identity_signer is not None:
+                    signed = identity_signer.sign(offer_sdp)
+                else:
+                    assert sign_offer is not None
+                    signed = sign_offer(offer_sdp)
+                if inspect.isawaitable(signed):
+                    if inspect.iscoroutine(signed):
+                        signed.close()
+                    raise TypeError("Offer signer must return a string synchronously")
+                if not isinstance(signed, str):
+                    raise TypeError("Offer signer must return a string")
+                if identity_signer is None:
+                    if "\r" in signed or "\n" in signed:
+                        raise InvalidIdentity("Identity envelope must contain one encoded value")
+                    signed = insert_identity(offer_sdp, signed)
+                if limits is not None:
+                    _check_sdp_size(signed, limits)
+                identities = 0
+                in_media = False
+                for line in signed.splitlines():
+                    if line.startswith("m="):
+                        in_media = True
+                    if line.strip().startswith("a=identity:"):
+                        if in_media or not line.startswith("a=identity:"):
+                            raise InvalidIdentity("Offer identity must be session-level")
+                        identities += 1
+                if identities != 1:
+                    raise InvalidIdentity("Signed offer must contain exactly one identity")
+                stripped, _ = extract_identity(signed)
+                if stripped != offer_sdp:
+                    raise InvalidIdentity("Offer signer changed non-identity SDP")
+                offer_sdp = signed
+            answer_sdp = await request_answer(
+                server_url,
+                str(local),
+                offer_sdp,
+                capability_check=capability_check,
+                timeout=negotiation_timeout,
+                limits=limits,
+            )
+            if on_server_identity is not None:
+                answer_sdp, server_identity = verify_server_identity(answer_sdp)
+                result = on_server_identity(server_identity)
+                if inspect.isawaitable(result):
+                    await result
+            else:
+                answer_sdp = strip_identity(answer_sdp)
+            await session.accept_answer(answer_sdp)
+            await conn._await_connected(None)
         return conn
     except BaseException:
-        await session.aclose(SessionError.GENERIC_FAILURE)
+        await conn._join_failed_connect()
         raise
 
 
@@ -588,6 +710,7 @@ class HttpServer:
         ice_servers: list | None,
         relay_only: bool,
         negotiation_timeout: float,
+        limits: ConnectionLimits | None = None,
     ) -> None:
         self._handler = handler
         self._local_id = local_id
@@ -596,12 +719,15 @@ class HttpServer:
         self._ice_servers = ice_servers
         self._relay_only = relay_only
         self._negotiation_timeout = negotiation_timeout
+        self._limits = limits
         self._signaling = HttpSignalingServer(
-            self._answer_offer, host=host, port=port, ssl_context=ssl_context
+            self._answer_offer, host=host, port=port, ssl_context=ssl_context, limits=limits
         )
         self._conns: dict[int, Connection] = {}
         self._handler_tasks: set[asyncio.Task] = set()
         self._closed = asyncio.Event()
+        self._closing_conns: set[Connection] = set()
+        self._close_task: asyncio.Task | None = None
 
     async def start(self) -> HttpServer:
         await self._signaling.start()
@@ -610,6 +736,8 @@ class HttpServer:
     # -- signaling callback ------------------------------------------------------------
 
     async def _answer_offer(self, network_id_text: str, offer_sdp: str) -> str:
+        if self._closed.is_set():
+            raise ConnectionFailed(SessionError.GENERIC_FAILURE)
         offer_sdp, envelope = extract_identity(offer_sdp)  # malformed -> InvalidIdentity -> 400
         remote_id = NetworkID.parse(network_id_text)
         if self._validate_offer is not None:
@@ -627,16 +755,22 @@ class HttpServer:
             ice_servers=self._ice_servers,
             relay_only=self._relay_only,
             negotiation_timeout=self._negotiation_timeout,
+            limits=self._limits,
         )
         self._conns[conn.connection_id] = conn
         try:
-            answer_sdp = await conn._session.answer(offer_sdp)
+            async with asyncio.timeout(
+                self._negotiation_timeout if self._limits is not None else None
+            ):
+                answer_sdp = await conn._session.answer(offer_sdp)
+            if self._identity_signer is not None:
+                answer_sdp = self._identity_signer.sign(answer_sdp)
+            if self._limits is not None:
+                _check_sdp_size(answer_sdp, self._limits)
         except BaseException:
             self._conns.pop(conn.connection_id, None)
-            await conn._session.aclose(SessionError.FAILED_TO_CREATE_ANSWER)
+            await conn._join_failed_connect()
             raise
-        if self._identity_signer is not None:
-            answer_sdp = self._identity_signer.sign(answer_sdp)
         return answer_sdp
 
     def _handle_open(self, conn: Connection) -> None:
@@ -648,6 +782,8 @@ class HttpServer:
     def _handle_close(self, conn: Connection, error: SessionError) -> None:
         self._conns.pop(conn.connection_id, None)
         conn._mark_closed(error)
+        self._closing_conns.add(conn)
+        conn._close_task.add_done_callback(lambda task: self._closing_conns.discard(conn))
 
     async def _run_handler(self, conn: Connection) -> None:
         try:
@@ -663,13 +799,17 @@ class HttpServer:
         await self._closed.wait()
 
     async def aclose(self) -> None:
-        if self._closed.is_set():
-            return
-        self._closed.set()
+        if self._close_task is None:
+            self._closed.set()
+            self._close_task = asyncio.create_task(self._close())
+            self._close_task.add_done_callback(Connection._close_done)
+        await asyncio.shield(self._close_task)
+
+    async def _close(self) -> None:
         await self._signaling.aclose()
         # Close sessions first so handlers end via ConnectionClosed; then reap stragglers.
-        for conn in list(self._conns.values()):
-            await conn._session.aclose()
+        conns = set(self._conns.values()) | self._closing_conns
+        await asyncio.gather(*(conn.close() for conn in conns))
         self._conns.clear()
         for task in list(self._handler_tasks):
             task.cancel()
@@ -706,6 +846,7 @@ def serve_http(
     ice_servers: list | None = None,
     relay_only: bool = False,
     negotiation_timeout: float = DEFAULT_NEGOTIATION_TIMEOUT,
+    limits: ConnectionLimits | None = None,
 ) -> HttpServer:
     """Accept connections via HTTP signaling (Onboarding Guide s4). Requires ``nethernet[http]``.
 
@@ -726,4 +867,5 @@ def serve_http(
         ice_servers=ice_servers,
         relay_only=relay_only,
         negotiation_timeout=negotiation_timeout,
+        limits=limits,
     )

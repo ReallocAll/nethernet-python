@@ -4,7 +4,7 @@
 def test_package_exposes_version():
     import nethernet
 
-    assert nethernet.__version__ == "0.0.1"
+    assert nethernet.__version__ == "0.0.2.dev0"
 
 
 def test_aiortc_is_importable():

@@ -54,6 +54,8 @@ class Transport:
         self._on_host_discovered = on_host_discovered
         self._discovered: dict[NetworkID, bytes] = {}
         self._tasks: set[asyncio.Task] = set()
+        self._closing = False
+        self._close_task: asyncio.Task | None = None
 
         self._manager = SessionManager(
             local_id=local_id,
@@ -85,8 +87,19 @@ class Transport:
         await self._lan.start()
 
     async def aclose(self) -> None:
-        await self._manager.aclose()
+        if self._close_task is None:
+            self._closing = True
+            self._close_task = asyncio.create_task(self._close())
+            self._close_task.add_done_callback(self._task_done)
+        await asyncio.shield(self._close_task)
+
+    async def _close(self) -> None:
         await self._lan.close()
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await self._manager.aclose()
 
     @property
     def local_id(self) -> NetworkID:
@@ -132,10 +145,17 @@ class Transport:
         self._lan.send_signal(remote_id, message)
 
     def _on_lan_signal(self, sender_id: NetworkID, message: str) -> None:
+        if self._closing:
+            return
         # LAN delivery is a sync callback; signaling dispatch is async, so schedule it.
         task = asyncio.create_task(self._manager.handle_signal(sender_id, message))
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._task_done)
+
+    def _task_done(self, task: asyncio.Task) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
 
     def _handle_host_discovered(self, network_id: NetworkID, data: bytes, addr: Address) -> None:
         self._discovered[network_id] = data

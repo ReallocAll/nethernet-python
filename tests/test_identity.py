@@ -1,5 +1,8 @@
 """Identity assertion mechanics — Onboarding Guide s5 (envelope, canonical JSON, JWS, JWT)."""
 
+import base64
+import json
+
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -79,8 +82,9 @@ def test_verify_fingerprints_rejects_wrong_key():
         verify_fingerprints(SDP, jws, generate_operator_key().public_key())
 
 
-def test_cpk_roundtrip():
-    key = generate_operator_key()
+@pytest.mark.parametrize("curve", [ec.SECP256R1(), ec.SECP384R1(), ec.SECP521R1()])
+def test_cpk_roundtrip(curve):
+    key = ec.generate_private_key(curve)
     decoded = decode_cpk(encode_cpk(key.public_key()))
     assert decoded.public_numbers() == key.public_key().public_numbers()
     with pytest.raises(InvalidIdentity):
@@ -147,6 +151,105 @@ def test_verify_server_identity_rejects_resigned_fingerprints():
     forged = insert_identity(
         SDP.replace("4A:AD", "FF:FF"),
         build_envelope(envelope.domain, envelope.token, attacker_jws),
+    )
+    with pytest.raises(InvalidIdentity):
+        verify_server_identity(forged)
+
+
+def public_jwk(key):
+    numbers = key.public_key().public_numbers()
+    curve, size = {
+        "secp256r1": ("P-256", 32),
+        "secp384r1": ("P-384", 48),
+        "secp521r1": ("P-521", 66),
+    }[key.curve.name]
+    return {
+        "kty": "EC",
+        "crv": curve,
+        "x": base64.urlsafe_b64encode(numbers.x.to_bytes(size, "big")).decode().rstrip("="),
+        "y": base64.urlsafe_b64encode(numbers.y.to_bytes(size, "big")).decode().rstrip("="),
+    }
+
+
+@pytest.mark.parametrize("curve", [ec.SECP256R1(), ec.SECP384R1(), ec.SECP521R1()])
+def test_jwk_cpk_and_server_identity_roundtrip(curve):
+    key = ec.generate_private_key(curve)
+    jwk = public_jwk(key)
+    decoded = decode_cpk(jwk)
+    assert decoded.public_numbers() == key.public_key().public_numbers()
+    signer = IdentitySigner(key, domain="offline.test", claims={"cpk": jwk})
+    stripped, identity = verify_server_identity(signer.sign(SDP))
+    assert stripped == SDP and identity.claims["cpk"] == jwk
+    assert identity.key_digest == cpk_digest(decode_cpk(encode_cpk(key.public_key())))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"kty": "RSA"},
+        {"kty": None},
+        {"crv": "P-255"},
+        {"crv": []},
+        {"x": None},
+        {"y": 12},
+        {"x": ""},
+        {"x": "A" * 42},
+        {"y": "A" * 44},
+        {"x": "A" * 42 + "="},
+        {"x": "+" * 43},
+        {"x": "_" * 43},
+        {"x": "A" * 43, "y": "A" * 43},
+        {"d": "private-key-material-is-not-accepted"},
+    ],
+)
+def test_jwk_cpk_rejects_malformed_coordinates_and_private_keys(changes):
+    jwk = public_jwk(ec.generate_private_key(ec.SECP256R1()))
+    jwk.update(changes)
+    with pytest.raises(InvalidIdentity):
+        decode_cpk(jwk)
+
+
+@pytest.mark.parametrize("missing", ["kty", "crv", "x", "y"])
+def test_jwk_cpk_rejects_missing_fields(missing):
+    jwk = public_jwk(generate_operator_key())
+    del jwk[missing]
+    with pytest.raises(InvalidIdentity):
+        decode_cpk(jwk)
+
+
+def test_jwk_cpk_rejects_noncanonical_coordinate_padding_bits():
+    jwk = public_jwk(ec.generate_private_key(ec.SECP256R1()))
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    jwk["x"] = jwk["x"][:-1] + alphabet[alphabet.index(jwk["x"][-1]) + 1]
+    with pytest.raises(InvalidIdentity):
+        decode_cpk(jwk)
+
+
+@pytest.mark.parametrize("tamper", ["alg", "signature", "fingerprints", "expired"])
+def test_jwk_cpk_preserves_signature_algorithm_fingerprint_and_expiry_checks(tamper):
+    key = generate_operator_key()
+    signer = IdentitySigner(
+        key,
+        domain="offline.test",
+        claims={"cpk": public_jwk(key)},
+        token_lifetime=-10 if tamper == "expired" else 60,
+    )
+    signed = signer.sign(SDP)
+    _, envelope = extract_identity(signed)
+    header, payload, signature = envelope.token.split(".")
+    if tamper == "alg":
+        header = (
+            base64.urlsafe_b64encode(json.dumps({"alg": "ES256"}).encode()).decode().rstrip("=")
+        )
+    elif tamper == "signature":
+        raw = bytearray(base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4)))
+        raw[-1] ^= 1
+        signature = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    forged = insert_identity(
+        SDP.replace("4A:AD", "FF:FF") if tamper == "fingerprints" else SDP,
+        build_envelope(
+            envelope.domain, ".".join((header, payload, signature)), envelope.fingerprints
+        ),
     )
     with pytest.raises(InvalidIdentity):
         verify_server_identity(forged)

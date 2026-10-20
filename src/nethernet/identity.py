@@ -151,10 +151,30 @@ def encode_cpk(public_key: ec.EllipticCurvePublicKey) -> str:
     return base64.b64encode(der).decode()
 
 
-def decode_cpk(text: str) -> ec.EllipticCurvePublicKey:
+def decode_cpk(text: str | dict) -> ec.EllipticCurvePublicKey:
+    """Decode a DER SPKI string or a public EC JWK."""
     try:
-        key = serialization.load_der_public_key(base64.b64decode(text, validate=True))
-    except (ValueError, TypeError):
+        if isinstance(text, dict):
+            if text.get("kty") != "EC" or "d" in text:
+                raise ValueError("cpk must be a public EC JWK")
+            curve, size = {
+                "P-256": (ec.SECP256R1, 32),
+                "P-384": (ec.SECP384R1, 48),
+                "P-521": (ec.SECP521R1, 66),
+            }[text["crv"]]
+            coordinates = []
+            for field in ("x", "y"):
+                encoded = text[field]
+                if not isinstance(encoded, str) or len(encoded) != (size * 4 + 2) // 3:
+                    raise ValueError("invalid JWK coordinate")
+                raw = _unb64url(encoded)
+                if len(raw) != size or _b64url(raw) != encoded:
+                    raise ValueError("noncanonical JWK coordinate")
+                coordinates.append(int.from_bytes(raw, "big"))
+            key = ec.EllipticCurvePublicNumbers(*coordinates, curve()).public_key()
+        else:
+            key = serialization.load_der_public_key(base64.b64decode(text, validate=True))
+    except (ValueError, TypeError, KeyError):
         raise InvalidIdentity("malformed cpk claim") from None
     if not isinstance(key, ec.EllipticCurvePublicKey):
         raise InvalidIdentity("cpk is not an EC public key")
@@ -341,7 +361,7 @@ def verify_server_identity(sdp: str) -> tuple[str, ServerIdentity]:
     if alg not in _ALGORITHMS:
         raise InvalidIdentity(f"unsupported JWT alg {alg!r}")
     cpk = claims.get("cpk")
-    if not isinstance(cpk, str):
+    if not isinstance(cpk, (str, dict)):
         raise InvalidIdentity("JWT has no cpk claim")
     public_key = decode_cpk(cpk)
     if not _verify_raw(public_key, alg, signing_input, signature):

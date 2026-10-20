@@ -147,6 +147,63 @@ Failures raise exceptions rather than returning sentinels. All inherit from `Net
 `.error` is a `SessionError`, the same code Bedrock reports: negotiation timeouts, ICE
 failure, data-channel close.
 
+## Bounded HTTP connections
+
+The local `0.0.2.dev0` candidate requires the matching patched
+`aiortc==1.15.0+nethernet.1` and `aioice==0.10.2+nethernet.1` wheels.
+`ConnectionLimits()` enables per-connection bounds for HTTP signaling, reliable
+application messages and direct host ICE. Pass `ice_servers=[]` explicitly;
+STUN, TURN and relay configurations are rejected in this mode. Omitting limits
+retains the unrestricted defaults.
+
+```python
+from nethernet import ConnectionLimits, connect_http
+
+conn = await connect_http(url, ice_servers=[], limits=ConnectionLimits(), timeout=10)
+permit = await conn.reserve_send(max_encoded_size)
+try:
+    data = encode_message()
+    permit.send_nowait(data)
+finally:
+    permit.release()
+await conn.close()
+```
+
+Reserve before encoding stateful or large messages. A permit covers the entire
+NetherNet message, including fragment headers and SCTP chunks. Its commit is
+synchronous; release is idempotent and is safe after commit. Cancellation before
+commit refunds the reservation. Impossible bounds raise `ValueError`.
+
+With limits enabled, `await conn.send(data)` attempts immediate admission and
+raises `BufferError` when storage is unavailable. It never waits while retaining
+an uncharged payload. Use `reserve_send()` to wait for capacity before producing
+the payload. Commit failures close the connection; do not retry a stateful payload.
+
+Default limits include:
+
+| Storage | Limit |
+| --- | --- |
+| Application message | 33,555,456 bytes |
+| Reserved/queued/outstanding send payload | 64 MiB + 4,096 bytes |
+| Retained send chunks / messages / waiting reservations | 65,536 / 512 / 64 |
+| Complete receive messages | 256 messages and 67,110,912 bytes |
+| Incomplete reliable message | Maximum application size and 10 seconds |
+| SCTP inbound payload / bookkeeping / active reassembly streams | 4 MiB / 8,192 entries / 16 |
+| Direct UDP reported write queue | 512 KiB, plus at most one active Proactor datagram |
+| Direct UDP receive queue | 2 MiB and 2,048 datagrams |
+| HTTP SDP / ICE candidates | 1 MiB / 64 |
+
+Overloaded receives and invalid framing fail the connection explicitly. Already
+queued complete messages remain readable. `close()` and `wait_closed()` join owned
+teardown; cancellation of one waiter does not cancel shared cleanup.
+
+`sign_offer` is an optional synchronous callback receiving the final gathered SDP
+and returning one encoded identity-envelope value. Final signed SDP is size-checked.
+It is mutually exclusive with `identity_signer`, which returns the complete signed SDP.
+`on_server_identity` receives a structurally verified assertion; the application
+must apply its trust policy, such as comparing `key_digest` with an explicit pin.
+These limits do not establish support for bounded LAN discovery or relayed ICE.
+
 ## Development
 
 This project uses [`uv`](https://docs.astral.sh/uv/).

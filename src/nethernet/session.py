@@ -17,6 +17,7 @@ from enum import Enum, auto
 
 from nethernet.constants import DEFAULT_NEGOTIATION_TIMEOUT
 from nethernet.errors import SendType, SessionError
+from nethernet.limits import ConnectionLimits
 from nethernet.network_id import NetworkID
 from nethernet.signaling.messages import (
     CandidateAdd,
@@ -54,6 +55,7 @@ class Session:
         ice_servers: list | None = None,
         relay_only: bool = False,
         negotiation_timeout: float = DEFAULT_NEGOTIATION_TIMEOUT,
+        limits: ConnectionLimits | None = None,
     ) -> None:
         self.connection_id = connection_id
         self.local_id = local_id
@@ -77,6 +79,7 @@ class Session:
             on_packet=self._handle_packet,
             on_channels_open=self._handle_channels_open,
             on_connection_state_change=self._handle_connection_state,
+            limits=limits,
         )
 
     # -- dialer entry point ------------------------------------------------------------
@@ -187,7 +190,7 @@ class Session:
             self.close(SessionError.DATA_CHANNEL_CLOSED)
 
     def _handle_packet(self, data: bytes) -> None:
-        if self._on_packet is not None:
+        if self.state != SessionState.CLOSED and self._on_packet is not None:
             self._on_packet(self, data)
 
     # -- application I/O ----------------------------------------------------------------
@@ -225,6 +228,7 @@ class Session:
         if notify_remote:
             self._send_signal(ConnectError(self.connection_id, error).serialize())
         self._close_task = asyncio.create_task(self._pc.close())
+        self._close_task.add_done_callback(self._pc._close_done)
         if self._on_close is not None:
             self._on_close(self, error)
 

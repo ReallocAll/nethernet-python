@@ -7,9 +7,10 @@ matching session, creating a listener session for an unknown CONNECTREQUEST.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 
-from nethernet.errors import SessionError
+from nethernet.errors import ConnectionFailed, SessionError
 from nethernet.network_id import NetworkID, new_connection_id
 from nethernet.session import DEFAULT_NEGOTIATION_TIMEOUT, Session
 from nethernet.signaling.messages import CandidateAdd, ConnectRequest, parse
@@ -42,6 +43,9 @@ class SessionManager:
         self._relay_only = relay_only
         self._negotiation_timeout = negotiation_timeout
         self._sessions: dict[int, Session] = {}
+        self._closing_sessions: dict[int, Session] = {}
+        self._closing = False
+        self._close_task: asyncio.Task | None = None
         # Candidates may arrive (UDP reordering) before the CONNECTREQUEST that creates the
         # listener session; buffer them per connection id and flush once it exists.
         self._pending_candidates: dict[int, list[CandidateAdd]] = {}
@@ -52,12 +56,16 @@ class SessionManager:
 
     async def connect(self, remote_id: NetworkID) -> Session:
         """Open a new outgoing (dialer) session to ``remote_id`` (SPEC.md s9.1)."""
+        if self._closing:
+            raise ConnectionFailed(SessionError.GENERIC_FAILURE)
         session = self._create_session(new_connection_id(), remote_id, is_dialer=True)
         await session.start()
         return session
 
     async def handle_signal(self, sender_id: NetworkID, message: str) -> None:
         """Dispatch an inbound signaling string to the matching session (SPEC.md s5, s9)."""
+        if self._closing:
+            return
         parsed = parse(message)
         if parsed is None:
             return  # unrecognized / malformed -> ignore (SPEC.md s5.2)
@@ -108,6 +116,12 @@ class SessionManager:
 
     def _handle_session_close(self, session: Session, error: SessionError) -> None:
         self._sessions.pop(session.connection_id, None)
+        self._closing_sessions[session.connection_id] = session
+        if session._close_task is not None:
+            def finished(task):
+                if self._closing_sessions.get(session.connection_id) is session:
+                    self._closing_sessions.pop(session.connection_id, None)
+            session._close_task.add_done_callback(finished)
         if self._on_session_close is not None:
             self._on_session_close(session, error)
 
@@ -116,6 +130,20 @@ class SessionManager:
             self._on_packet(session, data)
 
     async def aclose(self) -> None:
-        for session in list(self._sessions.values()):
-            await session.aclose()
+        if self._close_task is None:
+            self._closing = True
+            self._close_task = asyncio.create_task(self._close())
+            self._close_task.add_done_callback(self._close_done)
+        await asyncio.shield(self._close_task)
+
+    @staticmethod
+    def _close_done(task: asyncio.Task) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def _close(self) -> None:
+        sessions = list(self._sessions.values()) + list(self._closing_sessions.values())
+        await asyncio.gather(*(session.aclose() for session in sessions))
         self._sessions.clear()
+        self._closing_sessions.clear()
+        self._pending_candidates.clear()

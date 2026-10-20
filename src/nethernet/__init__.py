@@ -40,11 +40,12 @@ from nethernet.identity import (
     ServerIdentity,
     generate_operator_key,
 )
+from nethernet.limits import ConnectionLimits
 from nethernet.network_id import NetworkID, NetworkIDType, new_connection_id
 from nethernet.session import SessionState
 from nethernet.signaling.http import SignalingRejected
 
-__version__ = "0.0.1"
+__version__ = "0.0.2.dev0"
 
 __all__ = [
     # entry points
@@ -55,6 +56,7 @@ __all__ = [
     "serve_http",
     # connection objects
     "Connection",
+    "ConnectionLimits",
     "Server",
     "HttpServer",
     "DiscoveredHost",

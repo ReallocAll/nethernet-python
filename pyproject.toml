@@ -1,6 +1,6 @@
 [project]
 name = "nethernet"
-version = "0.0.1"
+version = "0.0.2.dev0"
 description = "Cleanroom Python implementation of Minecraft Bedrock's NetherNet P2P/LAN transport, built on aiortc."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,7 +17,7 @@ classifiers = [
 ]
 dependencies = [
     # WebRTC engine (ICE + DTLS + SCTP data channels). See SPEC.md s6.
-    "aiortc>=1.9",
+    "aiortc==1.15.0+nethernet.1",
     # AES-256-ECB + PKCS7 for the LAN discovery envelope. See SPEC.md s8.
     "cryptography>=42",
 ]
